@@ -166,6 +166,11 @@ public:
     /// target formats, depth and raster state) is what the libraries are keyed and built with.
     WarmResult WarmGraphicsLibraries(ShaderPools& pools, const GraphicsPipelineCacheKey& key,
                                      std::span<Shader::Environment* const> envs);
+    /// A channel's dirty tables were (re)built: the state watch must patch them again.
+    void ResetStateWatch() noexcept {
+        state_watch.Reset();
+        key_pipeline = nullptr;
+    }
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
@@ -267,6 +272,10 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    /// EDEN_NX2_PIPE_SKIP: the pipeline graphics_key was last resolved to, and what its state
+    /// was refreshed from. While both stand, a draw reuses it without a refresh or lookup.
+    GraphicsPipeline* key_pipeline{};
+    PipelineStateWatch state_watch;
 
     /// EDEN_NX2_GPL: shader libraries shared by the graphics pipelines. Declared before the
     /// pipelines, so it outlives them.
