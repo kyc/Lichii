@@ -724,6 +724,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     device.GetStorageBufferAlignment(), desc.count, [&](u32, u32 raw) {
                         const auto handle{TexturePair(raw, via_header_index)};
                         views.push_back({handle.first});
+                        if (use_bind_memo) {
+                            // Keep the one-handle-per-element invariant the memo lookup
+                            // and its fallback rely on; the table path resolves the
+                            // sampler through the memo instead of GetSamplerId.
+                            sampler_handles.push_back(handle.second);
+                            return;
+                        }
                         if (handle.second != last_sampler_index) {
                             sampler = texture_cache.GetSamplerId(handle.second, false);
                             last_sampler_index = handle.second;
