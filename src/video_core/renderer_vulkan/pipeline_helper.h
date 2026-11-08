@@ -465,6 +465,8 @@ public:
            VideoCore::Surface::IsPixelFormatASTC(format) ||
            VideoCore::Surface::IsPixelFormatBCn(format) ||
            VideoCore::Surface::IsPixelFormatETC2(format);
+}
+
 /// EDEN_NX2_BINDMEMO: what the descriptor made for a texture or image binding depends on besides
 /// its view and sampler, as TextureCache::FindBinding keys it.
 namespace BindingKind {
