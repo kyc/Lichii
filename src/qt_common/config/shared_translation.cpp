@@ -276,7 +276,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "the GPU after each dispatch.\nAuto marks what the shader's stores can reach and "
               "falls back to Full when that cannot be proven.\nFull marks the whole binding (up to "
               "8 MiB), the original behaviour: it can delay the game's own writes to nearby memory "
-              "(flickering effects) and copy far more data back from the GPU."));
+              "(flickering effects) and copy far more data back from the GPU.\n64 KiB cap marks at "
+              "most 64 KiB, which can miss data a large dispatch really wrote."));
     INSERT(Settings, use_asynchronous_shaders, tr("Enable asynchronous shader compilation"),
            tr("May reduce shader stutter."));
     INSERT(Settings, gpu_clock, tr("GPU Clocks"),
@@ -549,6 +550,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(NativeComputeWriteMark, Auto, tr("Auto (shader extent)")),
                               PAIR(NativeComputeWriteMark, Full, tr("Full binding")),
+                              PAIR(NativeComputeWriteMark, Cap64K, tr("64 KiB cap")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::GpuFenceBehavior>::Index(),
                           {

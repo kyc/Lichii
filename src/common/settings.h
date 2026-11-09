@@ -583,7 +583,8 @@ struct Values {
     // GPU-written. Its pointer carries no size, so the binding is up to 8 MiB; marking all of it
     // defers the CPU's later writes to those pages (Ocarina of Time's white leaves) and has fences
     // copy them back. Auto: the extent the shader's stores provably reach (the whole binding when
-    // unknown). Full: the whole binding (the behaviour before the store extent).
+    // unknown). Full: the whole binding (the behaviour before the store extent). Cap64K: at most
+    // 64 KiB.
     SwitchableSetting<NativeComputeWriteMark, true> native_compute_write_mark{
         linkage,
         NativeComputeWriteMark::Auto,
