@@ -938,6 +938,8 @@ void MainWindow::WebBrowserRequestExit() {
 #endif
 }
 
+/// Creates the render window, the loading screen and the status bar labels and buttons (shader
+/// warm-up label included).
 void MainWindow::InitializeWidgets() {
     render_window = new GRenderWindow(this, input_subsystem);
     render_window->hide();
@@ -973,6 +975,9 @@ void MainWindow::InitializeWidgets() {
     message_label->setAlignment(Qt::AlignLeft);
     statusBar()->addPermanentWidget(message_label, 1);
 
+    shader_warm_label = new QLabel();
+    shader_warm_label->setToolTip(
+        tr("Shaders prepared ahead of time so the game stutters less when it first uses them"));
     shader_building_label = new QLabel();
     shader_building_label->setToolTip(tr("The amount of shaders currently being built"));
     res_scale_label = new QLabel();
@@ -989,8 +994,8 @@ void MainWindow::InitializeWidgets() {
         tr("Time taken to emulate a Switch frame, not counting framelimiting or v-sync. For "
            "full-speed emulation this should be at most 16.67 ms."));
 
-    for (auto& label : {shader_building_label, res_scale_label, emu_speed_label, game_fps_label,
-                        emu_frametime_label}) {
+    for (auto& label : {shader_warm_label, shader_building_label, res_scale_label, emu_speed_label,
+                        game_fps_label, emu_frametime_label}) {
         label->setVisible(false);
         label->setFrameStyle(QFrame::NoFrame);
         label->setContentsMargins(4, 0, 4, 0);
@@ -1480,6 +1485,7 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
     }
 }
 
+/// Connects the game list, render window and loading screen signals to their handlers.
 void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::ReportCompatibilityRequested, this, [this](u64 program_id) {
         if (!report_session || report_session->program_id != program_id || emulation_running ||
@@ -2008,6 +2014,8 @@ bool MainWindow::SelectAndSetCurrentUser(
     return true;
 }
 
+/// Loads the game and starts emulation, showing the reason when it cannot start (a running shader
+/// warm-up build included).
 void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                           StartGameType type) {
     if (nup_running && filename.toStdString() == nup_source_path) {
@@ -2106,6 +2114,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
+    AskWarmBeforeStart(title_id);
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -2450,6 +2459,7 @@ void MainWindow::TerminateEmulationThread() {
     }
 }
 
+/// Resets the window and status bar to the no game state after emulation stops.
 void MainWindow::OnEmulationStopped() {
     if (!emulation_running) {
         return;
@@ -2509,6 +2519,7 @@ void MainWindow::OnEmulationStopped() {
 
     // Disable status bar updates
     status_bar_update_timer.stop();
+    shader_warm_label->setVisible(false);
     shader_building_label->setVisible(false);
     res_scale_label->setVisible(false);
     emu_speed_label->setVisible(false);
@@ -4305,6 +4316,19 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     if (!root)
         return;
     const QString convert_title = tr("Convert to NUP");
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        const auto source = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+        const auto& preparing = shader_warm_dialog->GamePath();
+        std::error_code error;
+        if (source == preparing || std::filesystem::equivalent(source, preparing, error)) {
+            QMessageBox::information(this, convert_title,
+                                     tr("Shaders for this game are being prepared. Try again when "
+                                        "preparation has finished."));
+            shader_warm_dialog->raise();
+            shader_warm_dialog->activateWindow();
+            return;
+        }
+    }
     const auto archive = FileSys::Nup::DefaultArchivePath(*root);
     if (std::filesystem::exists(archive)) {
         QMessageBox::information(this, convert_title,
@@ -4521,6 +4545,41 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
 }
 
 /// Deletes the game's precache files after a confirmation, showing the error when it fails.
+/// With shader_warm_at_boot = Ask and a warm-up the title has never finished, asks whether to run
+/// it on the loading screen before the game starts. "Don't ask again" keeps the answer as the
+/// setting (saved with the other settings).
+void MainWindow::AskWarmBeforeStart(u64 title_id) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    ShaderWarm::RequestWarmBeforeStart(false);
+    if (title_id == 0 ||
+        Settings::values.shader_warm_at_boot.GetValue() != Settings::ShaderWarmAtBoot::Ask ||
+        !ShaderWarm::WarmPending(title_id)) {
+        return;
+    }
+    QMessageBox box(QMessageBox::Question, tr("Prepare Shaders"),
+                    tr("The shaders of this game are not prepared yet. Prepare them now?\n\n"
+                       "The game starts when they are done: about 10 minutes the first time, on "
+                       "every CPU thread. Later launches skip this.\n\n"
+                       "Without it, they are prepared in the background while you play, with "
+                       "more stutter until then."),
+                    QMessageBox::NoButton, this);
+    QPushButton* const prepare = box.addButton(tr("Prepare now"), QMessageBox::AcceptRole);
+    box.addButton(tr("Start without"), QMessageBox::RejectRole);
+    box.setDefaultButton(prepare);
+    auto* const remember = new QCheckBox(tr("Don't ask again"), &box);
+    box.setCheckBox(remember);
+    box.exec();
+    const bool now = box.clickedButton() == prepare;
+    ShaderWarm::RequestWarmBeforeStart(now);
+    if (remember->isChecked()) {
+        Settings::values.shader_warm_at_boot.SetValue(now ? Settings::ShaderWarmAtBoot::Always
+                                                          : Settings::ShaderWarmAtBoot::Never);
+    }
+    LOG_INFO(Frontend, "Shader warm-up before the game starts: {}{}", now ? "yes" : "no",
+             remember->isChecked() ? " (don't ask again)" : "");
+}
+
+/// Deletes the game's warm-up files after a confirmation, showing the error when it fails.
 void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
     if (shader_warm_dialog && shader_warm_dialog->IsRunning() &&
         shader_warm_dialog->TitleId() == program_id) {
@@ -5030,6 +5089,8 @@ void MainWindow::OnTasStateChanged() {
     ui->action_TAS_Reset->setEnabled(emulation_running);
 }
 
+/// Refreshes the status bar while a game runs (TAS state, shader warm-up and build progress,
+/// speed, FPS and frame time). Stops its timer once the game is off.
 void MainWindow::UpdateStatusBar() {
     if (QtCommon::emu_thread == nullptr || !QtCommon::system->IsPoweredOn()) {
         status_bar_update_timer.stop();
@@ -5052,6 +5113,29 @@ void MainWindow::UpdateStatusBar() {
         shader_building_label->setVisible(true);
     } else {
         shader_building_label->setVisible(false);
+    }
+
+    const auto warm = shader_notify.GetWarmProgress();
+    if (warm.kind == 1 || warm.kind == 2) {
+        const auto done = static_cast<qulonglong>(warm.done);
+        const auto total = static_cast<qulonglong>(warm.total);
+        QString text;
+        if (warm.kind == 1) {
+            text = total > 0 ? tr("Shader warm-up: compute %L1 / %L2").arg(done).arg(total)
+                             : tr("Shader warm-up: compute %L1").arg(done);
+        } else if (total > 0) {
+            const int percent = static_cast<int>((std::min<qulonglong>)(done * 100 / total, 100));
+            text = tr("Shader warm-up: graphics %L1 / %L2 (%3%)")
+                       .arg(done)
+                       .arg(total)
+                       .arg(percent);
+        } else {
+            text = tr("Shader warm-up: graphics %L1").arg(done);
+        }
+        shader_warm_label->setText(text);
+        shader_warm_label->setVisible(true);
+    } else {
+        shader_warm_label->setVisible(false);
     }
 
     const auto res_info = Settings::values.resolution_info;

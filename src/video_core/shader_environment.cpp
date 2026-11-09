@@ -1151,6 +1151,7 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
 }
 
 void FileEnvironment::Deserialize(std::ifstream& file, std::streampos end) {
+    file_offset = file.tellg();
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -1188,7 +1189,8 @@ void FileEnvironment::Deserialize(std::ifstream& file, std::streampos end) {
             throw std::ios_base::failure("Too many values in a shader environment");
         }
     }
-    u64 left{static_cast<u64>(end - file.tellg())};
+    u64 left{end < std::streampos{} ? std::numeric_limits<u64>::max()
+                                    : static_cast<u64>(end - file.tellg())};
     const auto claim{[&left](u64 count, u64 entry_size) {
         if (count > left / entry_size) {
             throw std::ios_base::failure("Shader environment past the end of the pipeline cache");

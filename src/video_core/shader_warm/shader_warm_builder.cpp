@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +23,7 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/file_sys/nup_container.h"
@@ -29,7 +31,9 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_warm/shader_archives.h"
+#include "video_core/shader_warm/mesh_warm_builder.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
 
@@ -49,6 +53,11 @@ constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
 fs::path TitleDir(u64 title_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
            fmt::format("{:016x}", title_id);
+}
+
+/// True when `text` ends with `suffix`.
+bool EndsWith(std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() && text.substr(text.size() - suffix.size()) == suffix;
 }
 
 struct ArchiveFile {
@@ -137,21 +146,42 @@ struct PairHasher {
         return static_cast<size_t>(h.a[0] ^ (h.b[0] * 0x9E3779B97F4A7C15ULL));
     }
 };
+struct U128Hasher {
+    size_t operator()(const u128& h) const noexcept {
+        return static_cast<size_t>(h[0]);
+    }
+};
 
 u128 Hash128(std::span<const u8> bytes) {
     return Common::CityHash128(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
+/// One unique vertex or fragment program (make_graphics_warm.py: first manifest program per
+/// code hash, with the origins of that program's code + control identity).
+struct GraphicsProgram {
+    u32 stage{};
+    u128 control{};
+    std::vector<u32> archives;
+    bool built{};
+    u64 hash{};
+    u128 environment{};
+};
+
 struct Job {
     size_t seq{};
+    bool graphics{};
+    u32 stage{};
+    size_t graphics_index{};
     std::vector<u8> program;
+    std::vector<u8> constants;
     ComputeControl control{};
 };
 
 struct JobResult {
     bool ok{};
-    std::vector<u8> bytes; ///< The full compute entry
+    std::vector<u8> bytes; ///< Compute: full entry. Graphics: env record.
     ComputeKey compute_key{};
+    u64 hash{};
 };
 
 class Converter {
@@ -236,20 +266,26 @@ private:
         }
     }
 
-    /// Lowers one program and makes its compute entry. The result is not ok when lowering or
-    /// conversion failed.
+    /// Lowers one program and makes its compute entry or graphics env record. The result is not ok
+    /// when lowering or conversion failed.
     static JobResult Convert(const Job& job) {
         JobResult result;
         try {
             LoweredCode lowered;
-            if (const auto error = LowerProgram(job.program, lowered)) {
-                LOG_DEBUG(Render_Vulkan, "Shader precache: program not converted: {}", *error);
+            if (const auto error = LowerProgram(job.program, job.graphics, lowered)) {
+                LOG_DEBUG(Render_Vulkan, "Shader warm-up: program not converted: {}", *error);
                 return result;
             }
-            result.bytes = ComputeEntry(lowered, job.control, result.compute_key);
+            if (job.graphics) {
+                result.hash = StageHash(lowered.code);
+                result.bytes = GraphicsEnv(job.stage, lowered, job.program, job.constants);
+            } else {
+                result.bytes =
+                    ComputeEntry(lowered, job.control, job.constants, result.compute_key);
+            }
             result.ok = true;
         } catch (const std::exception& e) {
-            LOG_DEBUG(Render_Vulkan, "Shader precache: conversion failed: {}", e.what());
+            LOG_DEBUG(Render_Vulkan, "Shader warm-up: conversion failed: {}", e.what());
         }
         return result;
     }
@@ -292,8 +328,47 @@ void WriteWarmCount(const fs::path& warm_file, u64 entries) {
 
 } // Anonymous namespace
 
+} // Anonymous namespace
+
+bool WarmPending(u64 title_id) {
+    std::error_code ec;
+    for (const auto& file : {ComputeWarmPath(title_id), GraphicsWarmPath(title_id),
+                             MeshWarmPath(title_id)}) {
+        if (file == MeshWarmPath(title_id) &&
+            !Settings::values.use_mesh_shader_warmup.GetValue()) {
+            continue;
+        }
+        // A header-only file has no jobs (including titles with no mesh recipes).
+        if (fs::exists(file, ec) && fs::file_size(file, ec) > 12 && !ec &&
+            !fs::exists(WarmMarkerPath(file), ec)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+namespace {
+std::atomic<bool> warm_before_start{false};
+} // Anonymous namespace
+
+void RequestWarmBeforeStart(bool before_start) {
+    warm_before_start.store(before_start, std::memory_order_relaxed);
+}
+
+bool TakeWarmBeforeStart() {
+    return warm_before_start.exchange(false, std::memory_order_relaxed);
+}
+
 fs::path ComputeWarmPath(u64 title_id) {
     return TitleDir(title_id) / "warm-compute.bin";
+}
+
+fs::path GraphicsWarmPath(u64 title_id) {
+    return TitleDir(title_id) / "warm-graphics.bin";
+}
+
+fs::path MeshWarmPath(u64 title_id) {
+    return TitleDir(title_id) / "warm-mesh.bin";
 }
 
 fs::path WarmMarkerPath(const fs::path& warm_file) {
@@ -352,12 +427,6 @@ bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
         << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
     out.close();
     return static_cast<bool>(out);
-}
-
-bool WarmPending(u64 title_id) {
-    const auto file = ComputeWarmPath(title_id);
-    std::error_code ec;
-    return !fs::exists(file, ec) || !fs::exists(WarmMarkerPath(file), ec);
 }
 
 void RequestWarmBeforeStart(bool before_start) {
@@ -422,11 +491,20 @@ bool WritePrecachedPipelines(const fs::path& file, const DriverStamp& stamp,
 
 bool DeleteWarmFiles(u64 title_id, std::string* error) {
     const auto warm = ComputeWarmPath(title_id);
-    fs::path tmp = warm;
-    tmp += ".tmp";
+    const auto graphics = GraphicsWarmPath(title_id);
+    const auto mesh = MeshWarmPath(title_id);
+    fs::path warm_tmp = warm;
+    warm_tmp += ".tmp";
+    fs::path graphics_tmp = graphics;
+    graphics_tmp += ".tmp";
+    fs::path mesh_tmp = mesh;
+    mesh_tmp += ".tmp";
     bool ok = true;
     for (const auto& path :
-         {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, PrecachedPipelinesPath(title_id)}) {
+         {warm, WarmMarkerPath(warm), WarmCountPath(warm), warm_tmp,
+          graphics, WarmMarkerPath(graphics), WarmCountPath(graphics), graphics_tmp,
+          mesh, WarmMarkerPath(mesh), WarmCountPath(mesh), mesh_tmp,
+          PrecachedPipelinesPath(title_id)}) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -463,19 +541,65 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     std::error_code ec;
     fs::create_directories(output_dir, ec);
     const fs::path compute_path = output_dir / "warm-compute.bin";
+    const fs::path graphics_path = output_dir / "warm-graphics.bin";
+    const fs::path mesh_path = output_dir / "warm-mesh.bin";
+    fs::path mesh_tmp = mesh_path;
+    mesh_tmp += ".tmp";
     fs::path compute_tmp = compute_path;
     compute_tmp += ".tmp";
+    fs::path graphics_tmp = graphics_path;
+    graphics_tmp += ".tmp";
     std::ofstream compute_out;
+    std::ofstream graphics_out;
+    std::ofstream mesh_out;
     const auto fail = [&](std::string error) {
         compute_out.close();
+        graphics_out.close();
+        mesh_out.close();
         std::error_code ignored;
         fs::remove(compute_tmp, ignored);
+        fs::remove(graphics_tmp, ignored);
+        fs::remove(mesh_tmp, ignored);
         result.ok = false;
         result.error = std::move(error);
-        LOG_WARNING(Render_Vulkan, "Shader precache build for {:016x} failed: {}", title_id,
+        LOG_WARNING(Render_Vulkan, "Shader warm-up build for {:016x} failed: {}", title_id,
                     result.error);
         return result;
     };
+
+    // Draw state guesses.
+    std::vector<fs::path> caches;
+    if (options.runtime_caches) {
+        caches = *options.runtime_caches;
+    } else {
+        // The current version's cache, or right after a version bump, the newest older cache
+        // with the same record layout (the play history the guesses come from).
+        const auto own = VideoCommon::VersionedPipelineCachePath(
+            TitleDir(title_id), "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+        if (fs::exists(own, ec)) {
+            caches.push_back(own);
+        } else {
+            for (const u32 version : CompatibleRuntimeCacheVersions) {
+                const auto older =
+                    VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan", version);
+                if (fs::exists(older, ec)) {
+                    caches.push_back(older);
+                    break;
+                }
+            }
+        }
+    }
+    const RuntimeStats stats = ReadRuntimeStats(caches);
+    MeshWarmRecipes mesh_recipes{caches, options.mesh_candidates};
+    const bool use_stats = stats.occurrences != 0;
+    const GraphicsKey vertex_template = stats.templates[0] ? *stats.templates[0]
+                                                           : DefaultTemplate(true);
+    const GraphicsKey fragment_template = stats.templates[1] ? *stats.templates[1]
+                                                             : DefaultTemplate(false);
+    LOG_INFO(Render_Vulkan,
+             "Shader warm-up build for {:016x}: {} runtime stage records from {} cache(s){}",
+             title_id, stats.occurrences, caches.size(),
+             use_stats ? "" : ", built-in draw state defaults");
 
     GameFiles game;
     if (const auto error = OpenGame(system, game_path, game)) {
@@ -516,23 +640,39 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         try {
             dictionaries.Load(dictionary_pack->ReadAllBytes());
         } catch (const ArchiveError& e) {
-            LOG_WARNING(Render_Vulkan, "Shader precache: zstd dictionary pack: {}", e.what());
-        }
-    }
-    // Without archives the file is written empty: the precache then has only the pipeline cache
-    // of earlier sessions to build.
+    // Without archives the files are written empty: the precache then has only the
+    // pipeline cache of earlier sessions to build.
     result.archives = archives.size();
-    LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
+    LOG_INFO(Render_Vulkan, "Shader warm-up build: {} archives, {} zstd dictionaries",
              archives.size(), dictionaries.Count());
 
     compute_out.open(compute_tmp, std::ios::binary | std::ios::trunc);
-    if (!compute_out) {
+    graphics_out.open(graphics_tmp, std::ios::binary | std::ios::trunc);
+    mesh_out.open(mesh_tmp, std::ios::binary | std::ios::trunc);
+    if (!compute_out || !graphics_out || !mesh_out) {
         return fail("Cannot write to " + Common::FS::PathToUTF8String(output_dir));
     }
     WriteHeader(compute_out);
+    WriteHeader(graphics_out);
+    WriteHeader(mesh_out);
 
+    // Bookkeeping in program order (the order the manifest lists programs).
     std::unordered_set<PairHash, PairHasher> compute_identities;
-    std::unordered_set<std::string> compute_keys;
+    std::unordered_map<u128, size_t, U128Hasher> graphics_index; // code -> program
+    std::vector<GraphicsProgram> graphics;
+    std::unordered_set<u128, U128Hasher> compute_keys;
+    std::unordered_set<u128, U128Hasher> fragment_hashes;
+    std::unordered_set<u128, U128Hasher> vertex_hashes;
+    struct WrittenVertex {
+        size_t program;
+        u64 key_offset;
+    };
+    std::vector<WrittenVertex> written_vertices;
+    struct HeldVertex {
+        size_t program;
+        std::vector<u8> env;
+    };
+    std::vector<HeldVertex> held_vertices;
     size_t archive_errors = 0;
     size_t member_errors = 0;
     size_t seq = 0;
@@ -544,23 +684,56 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     auto converter = std::make_unique<Converter>(threads, stop);
 
     // Consumes finished conversions in submission order (first program wins on equal keys).
+    std::vector<std::pair<bool, size_t>> job_kinds; // graphics?, graphics program index
     size_t consumed = 0;
     const auto consume = [&](JobResult&& r) {
-        ++consumed;
+        const auto [is_graphics, index] = job_kinds[consumed++];
         if (!r.ok) {
             ++result.skipped;
             return;
         }
-        const std::string key(reinterpret_cast<const char*>(r.compute_key.data()),
-                              r.compute_key.size());
-        if (compute_keys.insert(key).second) {
-            compute_out.write(reinterpret_cast<const char*>(r.bytes.data()),
-                              static_cast<std::streamsize>(r.bytes.size()));
-            ++result.compute_programs;
+        if (!is_graphics) {
+            const u128 key = Hash128(r.bytes);
+            if (compute_keys.insert(key).second) {
+                compute_out.write(reinterpret_cast<const char*>(r.bytes.data()),
+                                  static_cast<std::streamsize>(r.bytes.size()));
+                ++result.compute_programs;
+            }
+            return;
         }
+        GraphicsProgram& program = graphics[index];
+        program.built = true;
+        program.hash = r.hash;
+        program.environment = Hash128(r.bytes);
+        if (program.stage == 4) {
+            if (!fragment_hashes.insert(program.environment).second) {
+                return; // same key as an earlier entry
+            }
+            const auto key = GraphicsEntryKey(4, fragment_template, r.hash, 0);
+            Write(graphics_out, u32{1});
+            graphics_out.write(reinterpret_cast<const char*>(r.bytes.data()),
+                               static_cast<std::streamsize>(r.bytes.size()));
+            graphics_out.write(reinterpret_cast<const char*>(key.data()),
+                               static_cast<std::streamsize>(key.size()));
+            ++result.fragment_programs;
+            return;
+        }
+        if (!vertex_hashes.insert(program.environment).second) {
+            // Same stage hash: same key only if the attribute guess matches, known at the end.
+            held_vertices.push_back({index, std::move(r.bytes)});
+            return;
+        }
+        const auto key = GraphicsEntryKey(0, vertex_template, r.hash, 0);
+        Write(graphics_out, u32{1});
+        graphics_out.write(reinterpret_cast<const char*>(r.bytes.data()),
+                           static_cast<std::streamsize>(r.bytes.size()));
+        const auto key_offset = static_cast<u64>(graphics_out.tellp());
+        graphics_out.write(reinterpret_cast<const char*>(key.data()),
+                           static_cast<std::streamsize>(key.size()));
+        written_vertices.push_back({index, key_offset});
     };
-    const auto drain = [&] {
-        while (auto r = converter->Next(false)) {
+    const auto drain = [&](bool wait_all) {
+        while (auto r = converter->Next(wait_all)) {
             consume(std::move(*r));
         }
     };
@@ -575,23 +748,47 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         const auto data = archive.file->ReadAllBytes();
         const auto name = archive.path.substr(archive.path.rfind('/') + 1);
         const auto on_record = [&](const ShaderRecord& record) {
-            if (record.stage != ProgramStage::Compute) {
+            const bool is_graphics =
+                record.stage == ProgramStage::Vertex || record.stage == ProgramStage::Fragment;
+            if (record.stage != ProgramStage::Compute && !is_graphics) {
                 return;
             }
-            if (!compute_identities.insert(PairHash{Hash128(record.code), Hash128(record.control)})
-                     .second) {
-                return;
-            }
-            const auto values = ReadComputeControl(record.control);
-            if (!values || !values->workgroup[0] || !values->workgroup[1] ||
-                !values->workgroup[2]) {
-                ++result.skipped;
-                return;
-            }
+            const std::array program_parts{Hash128(record.code), Hash128(record.constants)};
+            const u128 code = Common::CityHash128(
+                reinterpret_cast<const char*>(program_parts.data()), sizeof(program_parts));
+            const u128 control = Hash128(record.control);
             Job job;
-            job.control = *values;
+            if (is_graphics) {
+                const auto [it, inserted] = graphics_index.try_emplace(code, graphics.size());
+                if (!inserted) {
+                    GraphicsProgram& program = graphics[it->second];
+                    if (program.control == control) {
+                        program.archives.push_back(static_cast<u32>(archive_index));
+                    }
+                    return;
+                }
+                graphics.push_back({record.stage == ProgramStage::Vertex ? 0U : 4U, control,
+                                    {static_cast<u32>(archive_index)}});
+                job.graphics = true;
+                job.stage = graphics.back().stage;
+                job.graphics_index = it->second;
+            } else {
+                if (!compute_identities.insert(PairHash{code, control}).second) {
+                    return;
+                }
+                const auto values = ReadComputeControl(record.control);
+                if (!values || !values->workgroup[0] || !values->workgroup[1] ||
+                    !values->workgroup[2]) {
+                    ++result.skipped;
+                    return;
+                }
+                job.control = *values;
+                job.stage = 5;
+            }
             job.seq = seq++;
             job.program.assign(record.code.begin(), record.code.end());
+            job.constants.assign(record.constants.begin(), record.constants.end());
+            job_kinds.emplace_back(job.graphics, job.graphics_index);
             converter->Push(std::move(job));
             while (converter->Pending() > MaxPendingJobs && !stop.stop_requested()) {
                 if (auto r = converter->Next(true)) {
@@ -601,15 +798,20 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         };
         const auto on_member_error = [&](const std::string& error) {
             ++member_errors;
-            LOG_DEBUG(Render_Vulkan, "Shader precache: {}: {}", archive.path, error);
+            LOG_DEBUG(Render_Vulkan, "Shader warm-up: {}: {}", archive.path, error);
         };
         try {
-            WalkArchive(data, name, &dictionaries, on_record, on_member_error);
+            WalkArchive(data, name, &dictionaries, on_record, on_member_error,
+                        [&](std::span<const ShaderRecord> variation) {
+                            if (!stop.stop_requested()) {
+                                mesh_recipes.AddVariation(variation);
+                            }
+                        });
         } catch (const ArchiveError& e) {
             ++archive_errors;
-            LOG_WARNING(Render_Vulkan, "Shader precache: {}: {}", archive.path, e.what());
+            LOG_WARNING(Render_Vulkan, "Shader warm-up: {}: {}", archive.path, e.what());
         }
-        drain();
+        drain(false);
     }
     report(StageExtracting, archives.size(), archives.size());
 
@@ -626,13 +828,135 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     }
     report(StageConverting, total_jobs, total_jobs);
     converter.reset();
-
-    report(StageWriting, 0, 1);
-    compute_out.close();
-    if (!compute_out) {
-        return fail("Writing the precache file failed");
+    for (auto& archive : archives) {
+        archive.file = nullptr;
     }
-    // A new file: the marker and count of the old one no longer apply.
+    effects.clear();
+    dictionary_pack = nullptr;
+    game.romfs.clear();
+    game.loader.reset();
+    game.nup.reset();
+
+    // Vertex attribute types (make_graphics_warm.py attr_types): per slot, the most common
+    // nonzero value among the runtime pipelines of the OTHER vertex shaders of the same
+    // archive(s); slots without data are 1 (float). Without runtime data: built-in default.
+    std::unordered_map<std::string, u32> archive_ids;
+    for (size_t i = 0; i < archives.size(); ++i) {
+        archive_ids.try_emplace(archives[i].path, static_cast<u32>(archive_ids.size()));
+    }
+    const auto archive_id = [&](u32 index) { return archive_ids.at(archives[index].path); };
+    // Archive identity: the path inside the RomFS (the same file in both packages is one).
+    std::unordered_map<u32, std::set<u64>> by_archive;
+    for (const auto& program : graphics) {
+        if (program.stage == 0 && program.built &&
+            stats.vertex_attributes.contains(program.hash)) {
+            for (const u32 a : program.archives) {
+                by_archive[archive_id(a)].insert(program.hash);
+            }
+        }
+    }
+    const auto attribute_types = [&](const GraphicsProgram& program) -> u64 {
+        if (!use_stats) {
+            return DefaultAttributeTypes;
+        }
+        std::set<u64> others;
+        for (const u32 a : program.archives) {
+            if (const auto it = by_archive.find(archive_id(a)); it != by_archive.end()) {
+                others.insert(it->second.begin(), it->second.end());
+            }
+        }
+        others.erase(program.hash);
+        std::array<std::array<size_t, 4>, 32> counts{};
+        std::array<std::array<size_t, 4>, 32> first{};
+        size_t order = 0;
+        for (const u64 hash : others) {
+            for (const u64 value : stats.vertex_attributes.at(hash)) {
+                for (size_t i = 0; i < 32; ++i) {
+                    const auto x = static_cast<size_t>((value >> (2 * i)) & 3);
+                    if (x != 0) {
+                        if (counts[i][x]++ == 0) {
+                            first[i][x] = order++;
+                        }
+                    }
+                }
+            }
+        }
+        u64 types = 0;
+        for (size_t i = 0; i < 32; ++i) {
+            u64 best = 1;
+            size_t best_count = 0;
+            size_t best_first = 0;
+            for (size_t x = 1; x < 4; ++x) {
+                if (counts[i][x] > best_count ||
+                    (counts[i][x] == best_count && counts[i][x] != 0 && first[i][x] < best_first)) {
+                    best = x;
+                    best_count = counts[i][x];
+                    best_first = first[i][x];
+                }
+            }
+            types |= best << (2 * i);
+        }
+        return types;
+    };
+
+    report(StageWriting, 0, written_vertices.size() + held_vertices.size());
+    std::set<std::pair<u128, u64>> vertex_keys; // (environment, attribute types)
+    std::vector<std::pair<u64, u64>> patches;  // key offset, attribute types
+    for (const auto& written : written_vertices) {
+        const auto& program = graphics[written.program];
+        const u64 types = attribute_types(program);
+        vertex_keys.emplace(program.environment, types);
+        patches.emplace_back(written.key_offset + AttributeTypesOffset, types);
+    }
+    for (auto& held : held_vertices) {
+        const auto& program = graphics[held.program];
+        const u64 types = attribute_types(program);
+        if (!vertex_keys.emplace(program.environment, types).second) {
+            continue;
+        }
+        const auto key = GraphicsEntryKey(0, vertex_template, program.hash, types);
+        Write(graphics_out, u32{1});
+        graphics_out.write(reinterpret_cast<const char*>(held.env.data()),
+                           static_cast<std::streamsize>(held.env.size()));
+        graphics_out.write(reinterpret_cast<const char*>(key.data()),
+                           static_cast<std::streamsize>(key.size()));
+        held.env = {};
+    }
+    result.vertex_programs = vertex_keys.size();
+    report("Preparing mesh candidates", 0, mesh_recipes.VariationCount());
+    result.mesh_pipelines = mesh_recipes.Write(mesh_out, stop);
+    result.skipped += mesh_recipes.Skipped();
+    LOG_INFO(Render_Vulkan,
+             "Shader mesh warm-up: {} recorded templates, {} archive variations, {} candidates",
+             mesh_recipes.TemplateCount(), mesh_recipes.VariationCount(), result.mesh_pipelines);
+    compute_out.close();
+    graphics_out.close();
+    mesh_out.close();
+    if (stop.stop_requested()) {
+        return fail("Stopped");
+    }
+    if (!compute_out || !graphics_out || !mesh_out) {
+        return fail("Writing the warm-up files failed");
+    }
+    {
+        std::fstream patch(graphics_tmp, std::ios::binary | std::ios::in | std::ios::out);
+        if (!patch) {
+            return fail("Cannot reopen " + Common::FS::PathToUTF8String(graphics_tmp));
+        }
+        size_t done = 0;
+        for (const auto& [offset, types] : patches) {
+            patch.seekp(static_cast<std::streamoff>(offset));
+            patch.write(reinterpret_cast<const char*>(&types), sizeof(types));
+            if (++done % 4096 == 0) {
+                report(StageWriting, done, patches.size());
+            }
+        }
+        if (!patch) {
+            return fail("Writing the warm-up files failed");
+        }
+    }
+    // New files: the markers and counts of the old ones no longer apply. Each is removed right
+    // before its file is replaced, so a failed replacement leaves the other file's marker intact.
     std::error_code ignored;
     fs::remove(WarmMarkerPath(compute_path), ignored);
     fs::remove(WarmCountPath(compute_path), ignored);
@@ -640,13 +964,28 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (ec) {
         return fail("Cannot replace " + Common::FS::PathToUTF8String(compute_path));
     }
+    fs::remove(WarmMarkerPath(graphics_path), ignored);
+    fs::remove(WarmCountPath(graphics_path), ignored);
+    fs::rename(graphics_tmp, graphics_path, ec);
+    if (ec) {
+        return fail("Cannot replace " + Common::FS::PathToUTF8String(graphics_path));
+    }
     WriteWarmCount(compute_path, result.compute_programs);
-    report(StageWriting, 1, 1);
+    WriteWarmCount(graphics_path, result.vertex_programs + result.fragment_programs);
+    fs::remove(WarmMarkerPath(mesh_path), ignored);
+    fs::remove(WarmCountPath(mesh_path), ignored);
+    fs::rename(mesh_tmp, mesh_path, ec);
+    if (ec) {
+        return fail("Cannot replace " + Common::FS::PathToUTF8String(mesh_path));
+    }
+    WriteWarmCount(mesh_path, result.mesh_pipelines);
+    report(StageWriting, patches.size(), patches.size());
     result.ok = true;
     LOG_INFO(Render_Vulkan,
-             "Shader precache build for {:016x}: {} compute entries, {} programs skipped, {} "
-             "archive and {} member errors, {:.1f} s",
-             title_id, result.compute_programs, result.skipped, archive_errors, member_errors,
+             "Shader warm-up build for {:016x}: {} compute, {} vertex, {} fragment entries, {} "
+             "programs skipped, {} archive and {} member errors, {:.1f} s",
+             title_id, result.compute_programs, result.vertex_programs, result.fragment_programs,
+             result.skipped, archive_errors, member_errors,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     return result;
 }

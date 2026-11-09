@@ -76,6 +76,8 @@ struct Record {
     ProgramStage stage;
     Bytes code;
     Bytes control;
+    u32 variation = ~0U;
+    std::optional<Bytes> constants;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -482,7 +484,7 @@ std::vector<Record> ParseBnsh(Bytes data) {
                     throw ArchiveError("BNSH graphics stage disagrees with native header");
                 }
             }
-            result.push_back({stage, code, control});
+            result.push_back({stage, code, control, variation});
         }
     }
     return result;
@@ -723,6 +725,16 @@ std::vector<Record> ParseBahs(Bytes data) {
         const u64 code_size =
             info->stage == ProgramStage::Compute ? declared : instruction_allocation;
         const auto code = Extent(data, code_offset, code_size);
+        // The constant table follows the instructions, past the code extent.
+        const u64 constants_size = Le<u32>(control, 60);
+        const bool valid_constants = constants_size % 4 == 0 &&
+                                     constants_size <= allocation - instruction_allocation &&
+                                     code_offset <= data.size() &&
+                                     instruction_allocation <= data.size() - code_offset &&
+                                     constants_size <= data.size() - code_offset - instruction_allocation;
+        const Bytes constants = valid_constants && constants_size
+                                    ? Extent(data, code_offset + instruction_allocation, constants_size)
+                                    : Bytes{};
         if (info->stage == ProgramStage::Task || info->stage == ProgramStage::Mesh) {
             const u32 header_type = HeaderType(code);
             const bool header_ok = info->stage == ProgramStage::Task
@@ -731,14 +743,15 @@ std::vector<Record> ParseBahs(Bytes data) {
             if (code.size() <= 128 || (code.size() - 128) % 16 || !header_ok) {
                 throw ArchiveError("invalid BAHS task/mesh graphics envelope");
             }
-            records.push_back({info->stage, code, control});
+            records.push_back({info->stage, code, control, ~0U, constants});
         } else if (info->stage == ProgramStage::Compute) {
-            records.push_back({info->stage, code, control});
+            records.push_back({info->stage, code, control, ~0U, constants});
         } else {
-            const auto item = GraphicsRecord(code, control);
+            auto item = GraphicsRecord(code, control);
             if (item.stage != info->stage) {
                 throw ArchiveError("BAHS record disagrees with the graphics header stage");
             }
+            item.constants = constants;
             records.push_back(item);
         }
         cursor += length;
@@ -756,11 +769,45 @@ struct Walker {
     const ZstdDictionaries* dictionaries;
     const std::function<void(const ShaderRecord&)>& on_record;
     const std::function<void(const std::string&)>& on_member_error;
+    const std::function<void(std::span<const ShaderRecord>)>& on_variation;
+
+    /// The constant table the control section places inside the code allocation, if any.
+    static Bytes ConstantTable(const Record& record) {
+        if (record.control.size() < 68) {
+            return {};
+        }
+        const u64 size = Le<u32>(record.control, 60);
+        const u64 offset = Le<u32>(record.control, 64);
+        if (size == 0 || size % 4 || offset % 4 || offset + size > record.code.size()) {
+            return {};
+        }
+        return record.code.subspan(static_cast<size_t>(offset), static_cast<size_t>(size));
+    }
 
     /// Passes every record to the caller's record callback.
     void Emit(const std::vector<Record>& records) const {
         for (const auto& record : records) {
-            on_record(ShaderRecord{record.stage, record.code, record.control});
+            on_record(ShaderRecord{record.stage, record.code, record.control,
+                                   record.constants.value_or(ConstantTable(record))});
+        }
+        // Only BNSH provides verified variation boundaries. Never pair unrelated members.
+        if (on_variation) {
+            std::vector<ShaderRecord> group;
+            u32 previous = ~0U;
+            for (const auto& record : records) {
+                if (record.variation != previous && !group.empty()) {
+                    on_variation(group);
+                    group.clear();
+                }
+                previous = record.variation;
+                if (previous != ~0U) {
+                    group.push_back({record.stage, record.code, record.control,
+                                     record.constants.value_or(ConstantTable(record))});
+                }
+            }
+            if (!group.empty()) {
+                on_variation(group);
+            }
         }
     }
 
@@ -897,8 +944,9 @@ GameFileKind ClassifyGameFile(std::string_view path) {
 void WalkArchive(std::span<const u8> data, const std::string& name,
                  const ZstdDictionaries* dictionaries,
                  const std::function<void(const ShaderRecord&)>& on_record,
-                 const std::function<void(const std::string&)>& on_member_error) {
-    const Walker walker{dictionaries, on_record, on_member_error};
+                 const std::function<void(const std::string&)>& on_member_error,
+                 const std::function<void(std::span<const ShaderRecord>)>& on_variation) {
+    const Walker walker{dictionaries, on_record, on_member_error, on_variation};
     walker.Walk(data, name, 0);
 }
 

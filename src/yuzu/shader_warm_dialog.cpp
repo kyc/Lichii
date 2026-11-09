@@ -27,7 +27,9 @@ bool ShaderWarmFilesExist(u64 title_id) {
         return false;
     }
     std::error_code ec;
-    return std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec);
+    return std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec) ||
+           std::filesystem::exists(ShaderWarm::GraphicsWarmPath(title_id), ec) ||
+           std::filesystem::exists(ShaderWarm::MeshWarmPath(title_id), ec);
 }
 
 bool DeleteShaderWarmFiles(u64 title_id, std::string& error) {
@@ -51,6 +53,15 @@ QString StageText(const std::string& stage) {
         return ShaderWarmDialog::tr("Writing the precache file");
     }
     return QString::fromStdString(stage);
+}
+
+/// True when shader libraries are on (the setting or EDEN_NX2_GPL).
+bool ShaderLibrariesOn() {
+    if (Settings::values.use_graphics_pipeline_library.GetValue()) {
+        return true;
+    }
+    const char* value = std::getenv("EDEN_NX2_GPL");
+    return value && *value && *value != '0';
 }
 
 } // namespace
@@ -183,7 +194,8 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
     QString text;
     if (result.ok) {
         stage_label->setText(tr("Shader precache is ready."));
-        if (result.compute_programs == 0) {
+        if (result.compute_programs == 0 && result.vertex_programs == 0 &&
+            result.fragment_programs == 0) {
             text = result.archives == 0
                        ? tr("This game keeps its shaders in a format Lichii can't read, so none "
                             "are prepared from the game files.")
@@ -191,8 +203,11 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
             text += QLatin1Char(' ') +
                     tr("The shaders your earlier play sessions saved are still precached.");
         } else {
-            text = tr("Compute programs: %L1")
-                       .arg(static_cast<qulonglong>(result.compute_programs));
+            text = tr("Compute programs: %L1\nVertex programs: %L2\nFragment programs: %L3\nMesh candidates: %L4")
+                       .arg(static_cast<qulonglong>(result.compute_programs))
+                       .arg(static_cast<qulonglong>(result.vertex_programs))
+                       .arg(static_cast<qulonglong>(result.fragment_programs))
+                       .arg(static_cast<qulonglong>(result.mesh_pipelines));
         }
         if (result.skipped > 0) {
             text += QLatin1Char('\n') +
@@ -202,6 +217,11 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
         text += QStringLiteral("\n\n") +
                 tr("It is built on the loading screen when Precache shaders before game start is "
                    "on.");
+        if (!ShaderLibrariesOn()) {
+            text += QLatin1Char(' ') +
+                    tr("The graphics part also needs Shader libraries, in Configure, Graphics, "
+                       "Advanced.");
+        }
     } else if (stopped) {
         stage_label->setText(tr("Shader precache stopped."));
     } else {

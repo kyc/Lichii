@@ -181,6 +181,8 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
     if (total != previous_total) {
         ui->progress_bar->setMaximum(static_cast<int>(total));
         previous_total = total;
+        // A new total is a new part (the warm-up goes from compute to graphics): estimate anew.
+        slow_shader_compile_start = false;
     }
     // Reset the progress bar ranges if compilation is done
     if (stage == VideoCore::LoadCallbackStage::Complete) {

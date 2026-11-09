@@ -11,6 +11,7 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <charconv>
 #include <cstdio>
 #include <csignal>
 #include <cstring>
@@ -479,12 +480,16 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
-/// Hidden test hook (not in --help): builds a game's shader precache file without booting it.
+/// Hidden test hook (not in --help): builds a game's shader warm-up files without booting it.
 ///   yuzu-cmd --build-warm <game file> <title id hex> <output dir>
+///            [--mesh-candidates N] [--defaults | cache ...]
+/// With pipeline cache files, the draw state guesses come from them; --defaults uses the
+/// built-in guesses; neither uses the title's own pipeline cache when it exists.
 static bool BuildWarm(Core::System& system, int argc, char** argv) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     if (argc < 5) {
-        fmt::print(stderr, "usage: --build-warm <game> <title id> <output dir>\n");
+        fmt::print(stderr, "usage: --build-warm <game> <title id> <output dir> "
+                           "[--mesh-candidates 0..4096] [--defaults | cache ...]\n");
         return false;
     }
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
@@ -492,6 +497,31 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
     const u64 title_id = std::strtoull(argv[3], nullptr, 16);
     ShaderWarm::BuildOptions options;
     options.output_dir = Common::FS::ToU8String(argv[4]);
+    std::vector<std::filesystem::path> caches;
+    bool defaults = false;
+    for (int i = 5; i < argc; ++i) {
+        if (std::string_view{argv[i]} == "--defaults") {
+            defaults = true;
+        } else if (std::string_view{argv[i]} == "--mesh-candidates") {
+            if (++i >= argc) {
+                fmt::print(stderr, "--mesh-candidates requires a count from 0 to 4096\n");
+                return false;
+            }
+            const std::string_view count{argv[i]};
+            const auto [end, error] = std::from_chars(
+                count.data(), count.data() + count.size(), options.mesh_candidates);
+            if (error != std::errc{} || end != count.data() + count.size() ||
+                options.mesh_candidates > 4096) {
+                fmt::print(stderr, "--mesh-candidates requires a count from 0 to 4096\n");
+                return false;
+            }
+        } else {
+            caches.emplace_back(Common::FS::ToU8String(argv[i]));
+        }
+    }
+    if (defaults || !caches.empty()) {
+        options.runtime_caches = caches;
+    }
     std::string last_stage;
     auto last_print = std::chrono::steady_clock::now();
     const auto begin = last_print;
@@ -537,9 +567,10 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
             break;
         }
     }
-    fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"archives\": {}, \"compute\": {}, "
-               "\"skipped\": {}, \"seconds\": {:.1f}}}\n",
-               result.ok, error, result.archives, result.compute_programs, result.skipped,
+    fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"compute\": {}, \"vertex\": {}, "
+               "\"fragment\": {}, \"mesh\": {}, \"skipped\": {}, \"seconds\": {:.1f}}}\n",
+               result.ok, error, result.compute_programs, result.vertex_programs,
+               result.fragment_programs, result.mesh_pipelines, result.skipped,
                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     std::fflush(stdout);
     return result.ok;

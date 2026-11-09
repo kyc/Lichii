@@ -94,6 +94,10 @@ public:
         return native_source_size;
     }
 
+    [[nodiscard]] size_t CodeWords() const override {
+        return CachedSizeWords();
+    }
+
     [[nodiscard]] const std::shared_ptr<const LoweredNativeCode>& LoweredNative() const noexcept {
         return lowered_native;
     }
@@ -249,8 +253,14 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    /// Reads an environment that must end before `end`, the end of the file
-    void Deserialize(std::ifstream& file, std::streampos end);
+    /// Reads an environment that must end before `end`, the end of the file.
+    /// A negative `end` (the default) leaves the record unbounded, for readers
+    /// that delimit it by the counts it stores (the warm-up builders).
+    void Deserialize(std::ifstream& file, std::streampos end = std::streampos{-1});
+
+    std::streamoff FileOffset() const {
+        return file_offset;
+    }
 
     [[nodiscard]] size_t MemorySize() const;
 
@@ -295,6 +305,10 @@ public:
     }
     bool HasNativeInstructions() const override;
 
+    [[nodiscard]] size_t CodeWords() const override {
+        return code.size();
+    }
+
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
     /// Whether the translator asked for a constant buffer value, texture or pointer classification
@@ -308,6 +322,7 @@ public:
     }
 
 private:
+    std::streamoff file_offset{};
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;

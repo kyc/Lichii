@@ -11,6 +11,7 @@ add_executable(tests
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/spirv_inline_control.cpp
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
@@ -74,6 +75,7 @@ add_executable(tests
     video_core/pipeline_build.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
+    video_core/mesh_warm_builder.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
