@@ -345,18 +345,6 @@ bool WarmPending(u64 title_id) {
     return false;
 }
 
-namespace {
-std::atomic<bool> warm_before_start{false};
-} // Anonymous namespace
-
-void RequestWarmBeforeStart(bool before_start) {
-    warm_before_start.store(before_start, std::memory_order_relaxed);
-}
-
-bool TakeWarmBeforeStart() {
-    return warm_before_start.exchange(false, std::memory_order_relaxed);
-}
-
 fs::path ComputeWarmPath(u64 title_id) {
     return TitleDir(title_id) / "warm-compute.bin";
 }
@@ -638,6 +626,9 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         try {
             dictionaries.Load(dictionary_pack->ReadAllBytes());
         } catch (const ArchiveError& e) {
+            LOG_WARNING(Render_Vulkan, "Shader precache: zstd dictionary pack: {}", e.what());
+        }
+    }
     // Without archives the files are written empty: the precache then has only the
     // pipeline cache of earlier sessions to build.
     result.archives = archives.size();
