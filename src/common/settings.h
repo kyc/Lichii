@@ -658,6 +658,14 @@ struct Values {
                                                            true,
                                                            true};
 
+    SwitchableSetting<TensorPrograms> tensor_programs{linkage,
+                                                      TensorPrograms::Auto,
+                                                      "tensor_programs",
+                                                      Category::RendererAdvanced,
+                                                      Specialization::Default,
+                                                      true,
+                                                      true};
+
     SwitchableSetting<u32, true> native_pipeline_wait_ms{linkage,
                                                          8,
                                                          1,
