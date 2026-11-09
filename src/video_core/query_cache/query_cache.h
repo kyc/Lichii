@@ -521,6 +521,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     // EDEN_NX2_QUERY_LAZY_SYNC: whether guest memory holds the release's value (the fence ran
     // its operation at once, or the write below).
     const bool lazy_payload = counter_type == QueryType::Payload && LazyPayloadSync();
+    const bool is_synced = (Settings::IsGPUFenceBehaviorDefault()
+                                ? !Settings::IsGPULevelHigh()
+                                : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                      !Settings::IsGPUFenceBehaviorAccurate()) &&
+                           is_fence;
     const auto guest_holds_value = [pointer, has_timestamp, payload] {
         if (pointer == nullptr) {
             return false;

@@ -2442,6 +2442,8 @@ void PipelineCache::QueueVulkanPipelineCacheSave() {
         LOG_INFO(Render_Vulkan, "Driver pipeline cache saved after the shader precache, {} bytes",
                  size);
     });
+}
+
 bool PipelineCache::SaveVulkanPipelineCacheAndWait() {
     if (DriverCachesPipelines(device)) {
         return true;
