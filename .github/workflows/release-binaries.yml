@@ -616,7 +616,12 @@ jobs:
           # Asset names drop the commit sha: the release tag already identifies the build, and
           # stable names let the notes table link to them.
           strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
-          for artifact in artifacts/*/; do
+          # download-artifact puts a single artifact's files flat in artifacts/
+          # and one directory per artifact when there are several.
+          shopt -s nullglob
+          artifact_dirs=(artifacts/*/)
+          if [ ${#artifact_dirs[@]} -eq 0 ]; then artifact_dirs=(artifacts/); fi
+          for artifact in "${artifact_dirs[@]}"; do
             name=$(basename "$artifact")
             if compgen -G "$artifact*.AppImage" > /dev/null; then
               # Linux: ship the AppImage and the tar.gz as they are.
