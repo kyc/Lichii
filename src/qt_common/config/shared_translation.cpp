@@ -772,6 +772,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(TensorPrograms, Auto, tr("Auto")),
                               PAIR(TensorPrograms, Native, tr("Native")),
                               PAIR(TensorPrograms, Standin, tr("Stand-in")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::ShaderWarmAtBoot>::Index(),
                           {
                               PAIR(ShaderWarmAtBoot, Ask, tr("Ask")),
