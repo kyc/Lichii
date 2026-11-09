@@ -30,62 +30,9 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
-#include "video_core/nx2_query_fast.h"
-#include "video_core/nx2_reactive.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
-
-/// EDEN_NX2_GPU_PROFILE: what the fence manager does with each SignalFence, logged per second
-/// every 10 s by the thread that signals.
-namespace Nx2FenceStats {
-enum Stat : u32 {
-    Signals,         ///< SignalFence calls
-    Skipped,         ///< Empty fences not made (SkipEmptyFence)
-    Real,            ///< Fences with downloads or query results: they wait for the host GPU
-    Stubbed,         ///< Fences with only queued work (no host GPU wait)
-    ForcedSkip,      ///< Of Stubbed: the 64th empty fence in a row
-    QueryWork,       ///< Of Stubbed: query host syncs
-    QueuedOperations, ///< Of Stubbed: queued operations
-    Accurate,        ///< Of Stubbed: accurate GPU fences (callbacks wait for the fence)
-    Folded,          ///< Of Stubbed: work added to the newest queued fence (EDEN_NX2_FENCE_FOLD)
-    Inlined,         ///< Of Stubbed: work run at once, nothing queued (EDEN_NX2_FENCE_FOLD)
-    Syncpoints,      ///< SignalSyncPoint calls
-    SyncpointGuestNs, ///< Time in the guest increment's actions (the present's composite too)
-    Count,
-};
-inline std::array<std::atomic<u64>, Count> g_stats{};
-inline std::atomic<u64> g_window_start{};
-
-inline void Add(Stat stat, u64 amount = 1) {
-    g_stats[stat].fetch_add(amount, std::memory_order_relaxed);
-}
-
-inline void MaybeReport() {
-    const u64 now = Nx2Profile::Now();
-    u64 start = g_window_start.load(std::memory_order_relaxed);
-    if (start == 0) {
-        g_window_start.compare_exchange_strong(start, now);
-        return;
-    }
-    if (now - start < 10'000'000'000ULL || !g_window_start.compare_exchange_strong(start, now)) {
-        return;
-    }
-    const double seconds = static_cast<double>(now - start) / 1e9;
-    std::array<double, Count> rate{};
-    for (u32 i = 0; i < Count; ++i) {
-        rate[i] = static_cast<double>(g_stats[i].exchange(0, std::memory_order_relaxed)) / seconds;
-    }
-    LOG_INFO(HW_GPU,
-             "Fences per second: {:.0f} signals, {:.0f} skipped, {:.0f} waiting for the host "
-             "GPU, {:.0f} stubbed (64th skip {:.0f}, query syncs {:.0f}, queued operations {:.0f}, "
-             "accurate {:.0f}; folded {:.0f}, inline {:.0f}) | syncpoint increments {:.0f}, guest "
-             "actions {:.1f} ms",
-             rate[Signals], rate[Skipped], rate[Real], rate[Stubbed], rate[ForcedSkip],
-             rate[QueryWork], rate[QueuedOperations], rate[Accurate], rate[Folded], rate[Inlined],
-             rate[Syncpoints], rate[SyncpointGuestNs] / 1e6);
-}
-} // namespace Nx2FenceStats
 
 class FenceBase {
 public:
@@ -112,7 +59,6 @@ public:
     void TickFrame() {
         std::unique_lock lock(ring_guard);
         delayed_destruction_ring.Tick();
-        Nx2Reactive::g_frame.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Unlike other fences, this one doesn't
@@ -139,16 +85,6 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool profiling = Nx2Profile::Enabled();
-        if (profiling) [[unlikely]] {
-            Nx2FenceStats::Add(Nx2FenceStats::Signals);
-            Nx2FenceStats::MaybeReport();
-        }
-        // A guest read waits for downloads to land (Nx2Reactive::WaitLanding): submit the
-        // deferred work now rather than at the end of the batching window.
-        if (Nx2Reactive::GetLanding().waiters.load(std::memory_order_relaxed) != 0) {
-            SubmitDeferredWork();
-        }
         // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
         // fence runs its operation at once, before the host GPU has run the work the report
         // follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
@@ -165,12 +101,8 @@ public:
         if (Nx2Profile::Enabled()) {
             NoteFenceDecision(delay_fence, committed_flushes);
         }
-        skip_refusal.store(Nx2FenceStats::Accurate, std::memory_order_relaxed);
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
-            if (profiling) [[unlikely]] {
-                Nx2FenceStats::Add(Nx2FenceStats::Skipped);
-            }
             func();
             rasterizer.InvalidateGPUCache();
             return;
@@ -178,27 +110,6 @@ public:
         skipped_fences = 0;
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
-        const bool stubbed = !should_flush && committed_flushes == 0;
-        if (profiling) [[unlikely]] {
-            Nx2FenceStats::Add(stubbed ? Nx2FenceStats::Stubbed : Nx2FenceStats::Real);
-            if (stubbed) {
-                Nx2FenceStats::Add(skip_refusal.load(std::memory_order_relaxed));
-            }
-        }
-        if constexpr (can_async_check) {
-            if (stubbed && FenceFold()) {
-                // As the made fence below: its callback runs now, before its queued work.
-                if (!delay_fence) {
-                    func();
-                }
-                FoldStubbedFence(delay_fence, func);
-                if (delay_fence) {
-                    SubmitDeferredWork();
-                }
-                rasterizer.InvalidateGPUCache();
-                return;
-            }
-        }
         TFence new_fence = CreateFence(!should_flush);
         if constexpr (can_async_check) {
             guard.lock();
@@ -213,9 +124,6 @@ public:
             uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(committed_flushes);
-        if constexpr (can_async_check) {
-            pending_query_pops.push_back(1);
-        }
         QueueFence(new_fence);
         if (!delay_fence) {
             func();
@@ -242,17 +150,7 @@ public:
             LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
             return;
         }
-        // The guest sees the guest value (nx2:syncpt, the present's fence wait); its actions run
-        // here, the present's composite and frame tick among them. The host value goes with the
-        // fence: with accurate fences it joins the newest queued fence (FoldStubbedFence).
-        if (Nx2Profile::Enabled()) [[unlikely]] {
-            const u64 start = Nx2Profile::Now();
-            syncpoint_manager.IncrementGuest(value);
-            Nx2FenceStats::Add(Nx2FenceStats::Syncpoints);
-            Nx2FenceStats::Add(Nx2FenceStats::SyncpointGuestNs, Nx2Profile::Now() - start);
-        } else {
-            syncpoint_manager.IncrementGuest(value);
-        }
+        syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
         SignalFence(std::move(func));
     }
@@ -368,31 +266,24 @@ private:
             TFence fence;
             OperationList operations;
             u8 flushes;
-            u32 query_pops; ///< Query cache entries: one per fence, folded ones included
         };
         std::vector<Released> batch;
         batch.reserve(MaxBatch);
         const auto take_front = [&] {
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
-                             pending_flushes.front(), pending_query_pops.front()});
+                             pending_flushes.front()});
             fences.pop();
             pending_operations.pop_front();
             pending_flushes.pop_front();
-            pending_query_pops.pop_front();
         };
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                // Work the GPU thread runs inline (FoldStubbedFence) goes before any fence
-                // queued meanwhile.
-                cv.wait(lock, [&] {
-                    return stop_token.stop_requested() || (!fences.empty() && !inline_running);
-                });
+                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
                 take_front();
-                fence_thread_busy = true;
             }
             if (!batch.front().fence->IsStubbed()) {
                 WaitFence(batch.front().fence);
@@ -427,9 +318,7 @@ private:
             }
             // Queries and operations keep their per-fence order.
             for (Released& released : batch) {
-                for (u32 i = 0; i < released.query_pops; ++i) {
-                    query_cache.PopAsyncFlushes();
-                }
+                query_cache.PopAsyncFlushes();
                 for (auto& operation : released.operations) {
                     operation();
                 }
@@ -444,13 +333,10 @@ private:
                 }
             }
             batch.clear();
-            {
-                std::scoped_lock lock(guard);
-                fence_thread_busy = false;
-            }
         }
     }
 
+<<<<<<< HEAD
     /// EDEN_NX2_FENCE_FOLD: a fence with nothing to wait for on the host GPU (no downloads, no
     /// query results) carries only queued work: the query cache's slot cleanup, operations, and
     /// with accurate fences its callback (a syncpoint's host increment). The fencing thread runs
@@ -533,6 +419,8 @@ private:
         cv.notify_all();
     }
 
+=======
+>>>>>>> parent of 01a62274 (tuned: upstream PR #717 - binding memo (EDEN_NX2_BINDMEMO/BINDCACHE) and front-state/draw-batch split work (rebased on build-125))
     bool ShouldWait() const {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         return texture_cache.ShouldWaitAsyncFlushes() || buffer_cache.ShouldWaitAsyncFlushes() ||
@@ -632,23 +520,13 @@ private:
     }
 
     bool SkipEmptyFence() {
-        if constexpr (requires { query_cache.HasPendingFenceWork(true); }) {
-            // EDEN_NX2_FENCE_TRIM: payload releases (QMD releases, ~4,300 a second in Ocarina)
-            // write guest memory at once anyway; their host buffer syncs (a render pass end and
-            // two barriers each) go together with the next fence made or host wait.
-            if (skipped_fences >= 64) {
-                skip_refusal.store(Nx2FenceStats::ForcedSkip, std::memory_order_relaxed);
-                return false;
-            }
-            if (query_cache.HasPendingFenceWork(Nx2QueryFast::FenceTrim())) {
-                skip_refusal.store(Nx2FenceStats::QueryWork, std::memory_order_relaxed);
+        if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+            if (skipped_fences >= 64 || query_cache.HasPendingFenceWork()) {
                 return false;
             }
             {
                 std::scoped_lock lock{uncommitted_guard};
                 if (!uncommitted_operations.empty()) {
-                    skip_refusal.store(Nx2FenceStats::QueuedOperations,
-                                       std::memory_order_relaxed);
                     return false;
                 }
             }
@@ -666,12 +544,7 @@ private:
     OperationList uncommitted_operations;
     std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
-    std::deque<u32> pending_query_pops; ///< Async check, per fence: query cache entries to pop
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
-    /// Why the last fence was made (profile counters; any signalling thread, so atomic)
-    std::atomic<Nx2FenceStats::Stat> skip_refusal{};
-    bool fence_thread_busy{}; ///< Guarded by guard: the fencing thread releases fences it took
-    bool inline_running{};    ///< Guarded by guard: FoldStubbedFence runs a fence's work inline
 
     std::mutex guard;
     std::mutex ring_guard;

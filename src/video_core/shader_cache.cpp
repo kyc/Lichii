@@ -423,7 +423,6 @@ void ShaderCache::RemovePendingShaders() {
         lookup_cache.erase(it);
     }
     marked_for_removal.clear();
-    removal_pending.store(false, std::memory_order_release);
 
     if (!removed_shaders.empty()) {
         Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
@@ -453,7 +452,6 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
-        removal_pending.store(true, std::memory_order_release);
     }
 }
 

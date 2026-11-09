@@ -11,9 +11,6 @@ struct RasterizerDownloadArea {
     VAddr start_address;
     VAddr end_address;
     bool preemtive;
-    /// Not preemtive, but every GPU write there has a download on its way: wait for it to land
-    /// instead of flushing (Nx2Reactive::WaitLanding).
-    bool wait_landing{};
 };
 
 } // namespace VideoCore
