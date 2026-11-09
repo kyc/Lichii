@@ -328,8 +328,6 @@ void WriteWarmCount(const fs::path& warm_file, u64 entries) {
 
 } // Anonymous namespace
 
-} // Anonymous namespace
-
 bool WarmPending(u64 title_id) {
     std::error_code ec;
     for (const auto& file : {ComputeWarmPath(title_id), GraphicsWarmPath(title_id),
