@@ -1663,6 +1663,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
              stop_loading.stop_requested() ? "stopped" : (skipped ? "skipped" : "finished"),
              total_built, done - total_built, jobs.size() - std::min(jobs.size(), done.load()),
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+}
+
 /// The warm-up on the loading screen: reports the running part's progress until both warm-ups
 /// have ended (or the load is stopped, which cancels them), so the game starts after them.
 void PipelineCache::WaitForWarmUps(std::stop_token stop_loading,

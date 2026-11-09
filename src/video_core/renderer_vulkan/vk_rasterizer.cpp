@@ -2515,7 +2515,6 @@ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
     std::optional<VideoCore::RasterizerDownloadArea> texture_area;
-    {
     // EDEN_NX2_READ_FASTPATH: guest cores ask this on reads of GPU-cached pages, and the back
     // thread holds both caches' locks through each draw. Pages no image was ever registered on
     // need no look into the texture cache, and pages never GPU-written or read-trapped (with
