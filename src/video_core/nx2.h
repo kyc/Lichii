@@ -57,7 +57,6 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
         if ((word.load(std::memory_order_relaxed) & bits) != bits) {
             word.fetch_or(bits, std::memory_order_relaxed);
         }
-        page += bits;
     }
 }
 
