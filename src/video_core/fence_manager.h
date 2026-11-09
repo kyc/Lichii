@@ -491,7 +491,7 @@ private:
         }
         if (!fence_thread_busy && !inline_running && GpuSplit::OnBackThread()) {
             inline_running = true;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             {
                 std::scoped_lock ops_lock{uncommitted_guard};
                 operations.swap(uncommitted_operations);

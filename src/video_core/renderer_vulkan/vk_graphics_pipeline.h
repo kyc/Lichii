@@ -340,10 +340,6 @@ public:
         transition_tags.clear();
     }
 
-    [[nodiscard]] bool WritesStorage() const noexcept {
-        return writes_storage;
-    }
-
     /// Writes storage images or image buffers (their images are marked modified when resolved).
     [[nodiscard]] bool WritesImages() const noexcept {
         return writes_images;
