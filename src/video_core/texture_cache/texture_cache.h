@@ -2654,6 +2654,13 @@ u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
     if ((IsPixelFormatASTC(image.info.format) &&
          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
         True(image.flags & ImageFlagBits::Converted)) {
+        // The host copy's own memory where the runtime tells it: an ASTC image is not always
+        // what the re-compression setting says (kept as RGBA8, fewer levels).
+        if constexpr (requires { image.MemoryBlock(); }) {
+            if (const u64 host_size = image.MemoryBlock().size; host_size != 0) {
+                return Common::AlignUp(host_size, 1024);
+            }
+        }
         tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
     }
     return Common::AlignUp(tentative_size, 1024);
