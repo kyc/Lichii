@@ -127,6 +127,7 @@ struct ComputePipelineCacheEntry {
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
+    /// Sets the eviction limit from pipeline_eviction_threshold, or from the RAM when it is 0.
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
@@ -141,6 +142,8 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
 
+    /// Loads the title's disk shader cache, builds the pipelines recent sessions used, and sizes
+    /// the kept-pipeline limit to what it loaded (KeptPipelines).
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -277,6 +280,13 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    /// Logs which eviction applies this session: none, the old frame-based one, or the limit of
+    /// built pipelines kept (kept_pipelines).
+    void LogEvictionPolicy() const;
+    /// Built graphics pipelines kept before unused ones are destroyed (0: the old 9,000-frame
+    /// eviction, on Android; see KeptPipelines). Set at construction and again once the disk
+    /// cache has loaded, read on the GPU thread.
+    std::atomic<size_t> kept_pipelines{0};
     u64 frame_count{};
     /// Wait budget of native draws for unbuilt pipelines left in this frame, in microseconds
     /// (native_async_draws = Bounded). Only touched on the GPU thread; reset in TickFrame.
